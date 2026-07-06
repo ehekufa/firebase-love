@@ -8,6 +8,8 @@ local config = {
     verifySSL = false,
 }
 
+local activeListeners = {}
+
 local function hasHttps()
     local ok, _ = pcall(require, "https")
     return ok
@@ -157,6 +159,95 @@ end
 
 function firebase.getToken()
     return config.authToken
+end
+
+function firebase.listen(path, callback)
+    if activeListeners[path] then
+        activeListeners[path].connection:close()
+        activeListeners[path] = nil
+    end
+
+    if not config.authToken then
+        error("firebase: not authenticated")
+    end
+
+    local url = config.dbURL .. "/" .. path .. ".json?auth=" .. config.authToken
+    local socket = require("socket")
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+
+    local req = {
+        url = url,
+        method = "GET",
+        headers = {
+            ["Accept"] = "text/event-stream",
+        },
+        sink = ltn12.sink.table({}),
+        create = function()
+            local sock = socket.tcp()
+            sock:settimeout(0)
+            return sock
+        end,
+    }
+
+    local conn = http.request(req)
+    if not conn then
+        callback(false, "Failed to connect")
+        return
+    end
+
+    activeListeners[path] = {
+        callback = callback,
+        connection = conn,
+    }
+
+    local function reader()
+        while true do
+            local chunk, err = conn:receive("*l")
+            if err then
+                firebase.listen(path, callback)
+                break
+            end
+            if chunk and chunk ~= "" and chunk:match("^data: ") then
+                local jsonData = chunk:sub(7)
+                local ok, data = pcall(love.data.decode, "json", jsonData)
+                if ok and data then
+                    callback(true, data)
+                end
+            end
+        end
+    end
+
+    local co = coroutine.create(reader)
+    activeListeners[path].coroutine = co
+    coroutine.resume(co)
+end
+
+function firebase.unlisten(path)
+    if activeListeners[path] then
+        activeListeners[path].connection:close()
+        activeListeners[path] = nil
+    end
+end
+
+function firebase.update()
+    for path, listener in pairs(activeListeners) do
+        if listener.coroutine then
+            local status = coroutine.status(listener.coroutine)
+            if status == "suspended" then
+                coroutine.resume(listener.coroutine)
+            elseif status == "dead" then
+                activeListeners[path] = nil
+            end
+        end
+    end
+end
+
+function firebase.closeAll()
+    for path, listener in pairs(activeListeners) do
+        listener.connection:close()
+    end
+    activeListeners = {}
 end
 
 return firebase
